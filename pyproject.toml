@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omega-chain-wallet"
-version = "0.1.0"
+version = "0.2.0"
 description = "Host-side F1R3node signing key storage for OmegaHive"
 requires-python = ">=3.12"
 dependencies = ["coincurve>=20,<22", "cryptography>=42"]

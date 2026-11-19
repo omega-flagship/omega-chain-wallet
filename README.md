@@ -1,6 +1,16 @@
 # Omega Chain Wallet
 
-Chain Wallet stores the Hive host’s F1R3node secp256k1 deploy signers. In OmegaHive, **Apps → Chain Wallet** shows the full uncompressed public keys. The app lists encrypted record filenames and has no actions. Key creation, import and signing take place on the host.
+Chain Wallet stores the Hive host’s F1R3node secp256k1 deploy signers. In **Apps → Chain Wallet**, viewers see signer names and full uncompressed public keys. The signed-in Hive local operator can generate, import and rename signers. Deploy signing runs on the host.
+
+## Manage signers in OmegaHive
+
+Open **Apps → Chain Wallet** after initializing the host wallet.
+
+- **Generate key** creates a new secp256k1 signer on the host. You can enter a name before saving. A new signer starts unfunded.
+- **Import key** accepts a 64-digit hex private key in a masked field. The browser encrypts it for the wallet process using Web Crypto RSA-OAEP with SHA-256. Use HTTPS or localhost. A Hive restart rotates the import recipient. Refresh the app if an import was interrupted. For encrypted F1R3node PKCS#8 files, use the host CLI below.
+- **Rename** adds, changes or clears the name of any signer, including keys previously added through the CLI. Importing an existing key preserves its name unless you supply another one. The app reports when a duplicate import changes the name.
+
+Names are visible to everyone who can view the app. The host stores them in owner-only `.name` files alongside the encrypted records. A name identifies a signer in the interface. Chain integrations continue to select it by its public key.
 
 ## Set up a wallet
 
@@ -47,7 +57,7 @@ PY
 export HIVE_APP_PINS
 ```
 
-Start Hive with that environment. Open Chain Wallet in a swarm and use **Refresh** after adding a key. The list belongs to the host and is visible to users with access to that app. After an update, reinstall the host package and refresh the app pin.
+Start Hive with that environment. Open Chain Wallet in a swarm and use **Refresh** after adding a key through the CLI. The list belongs to the host and is visible to users with access to that app. After an update, reinstall the host package and refresh the app pin.
 
 ## Sign benchmark deploys
 
@@ -73,7 +83,7 @@ Use separate directories on a local Linux filesystem under trusted parent direct
 
 Back up the complete encrypted record directory and the wrapping key separately, with access restricted to the operator. Restore both to recover signing. Losing the wrapping key requires recovery from an independent backup of the original signer. Import leaves the source file under its existing protection.
 
-The Unix service account is the custody boundary. Code running as that account or as root can use its keys. Run untrusted minds outside that account’s filesystem access. Hive’s app bridge exposes only the public list.
+The Unix service account is the custody boundary. Code running as that account or as root can use its keys. Run untrusted minds outside that account’s filesystem access. The app checks the local operator identity supplied by Hive for every wallet edit. Only the encrypted import payload crosses the app bridge. Generated private keys and the wrapping key stay on the host.
 
 ## Verification
 
