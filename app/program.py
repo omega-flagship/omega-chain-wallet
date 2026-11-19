@@ -1,13 +1,15 @@
 """OmegaHive signer management. Only public metadata leaves the host wallet."""
+import asyncio
 import base64
 import binascii
 import re
+from functools import wraps
 from threading import Lock
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from omega_chain_wallet import Wallet, WalletChanged, WalletError, wallet_revision
+from omega_chain_wallet import Wallet, WalletChanged, WalletError
 
 
 # Only the host process holds the import recipient's private key. Reloading the app rotates it.
@@ -41,30 +43,40 @@ def _operator(identity, kind):
             and identity.get("local_operator") is True and identity.get("route") == "operator")
 
 
+def _off_loop(fn):
+    """Hive awaits program results. Its standalone checker also calls view synchronously."""
+    @wraps(fn)
+    def run(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return fn(*args, **kwargs)
+        return asyncio.to_thread(fn, *args, **kwargs)
+    return run
+
+
+@_off_loop
 def view(ctx, focus, stage):
+    match = re.fullmatch(r"page-([1-9][0-9]{0,8})", focus or "")
     try:
-        entries = Wallet.from_env().entries()
-    except (WalletError, OSError, RuntimeError):
+        page = Wallet.from_env().signer_page(int(match[1]) if match else 1,
+                                             focus=None if match else focus)
+    except (WalletError, OSError, RuntimeError) as exc:
+        summary = str(exc) if isinstance(exc, WalletError) else "The host could not read the public key list."
         return {"title": "Chain Wallet", "revision": "unavailable", "focus": "wallet",
                 "items": [{"id": "wallet", "kind": "wallet", "label": "Wallet unavailable",
-                           "summary": "The host could not read the public key list."}], "links": []}
+                           "summary": summary}], "links": []}
 
-    page_size = 32
-    pages = max(1, (len(entries) + page_size - 1) // page_size)
-    match = re.fullmatch(r"page-([1-9][0-9]{0,8})", focus or "")
-    page = min(int(match[1]), pages) if match else 1
-    if focus and not match:
-        page = next((i // page_size + 1 for i, (key, _) in enumerate(entries) if key == focus), 1)
-    root = {"id": "wallet", "kind": "wallet", "label": "Signers", "page": page,
-            "pages": pages, "count": len(entries)}
+    root = {"id": "wallet", "kind": "wallet", "label": "Signers", "page": page.number,
+            "pages": page.pages, "count": page.count}
     if _operator(getattr(ctx, "viewer", None), "operator"):
         der = _import_recipient().public_key().public_bytes(
             serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         root["import_recipient"] = base64.b64encode(der).decode("ascii")
     items = [root]
-    for key, name in entries[(page - 1) * page_size:page * page_size]:
+    for key, name in page.entries:
         items.append({"id": key, "kind": "public-key", "label": name or key, "name": name, "public_key": key})
-    return {"title": "Chain Wallet", "revision": f"{wallet_revision(entries)}/{page}", "focus": "wallet",
+    return {"title": "Chain Wallet", "revision": f"{page.revision}/{page.number}", "focus": "wallet",
             "items": items, "links": []}
 
 
@@ -78,6 +90,7 @@ def _open_envelope(envelope):
         raise WalletError("Could not open the import. Refresh the wallet and enter the key again.") from None
 
 
+@_off_loop
 def act(ctx, action, items, params):
     if not _operator(getattr(ctx, "actor", None), "person") or getattr(ctx, "read_only", False):
         return {"status": "refused", "message": "Only the Hive local operator can manage this wallet."}
@@ -86,12 +99,14 @@ def act(ctx, action, items, params):
         return {"status": "stale", "message": "Refresh the wallet before editing signers."}
     revision = revision.split("/", 1)[0]
     name = params.get("name", "")
+    detail = {}
     try:
         wallet = Wallet.from_env()
         if action == "generate" and not items:
             public = wallet.generate(name, revision=revision)
         elif action == "import" and not items:
-            public = wallet.import_secret(_open_envelope(params.get("envelope")), name, revision=revision)
+            public, detail["import_outcome"] = wallet.import_signer(
+                _open_envelope(params.get("envelope")), name, revision=revision)
         elif action == "rename" and len(items) == 1 and "name" in params:
             public = wallet.rename(items[0], name, revision=revision)
         else:
@@ -102,4 +117,5 @@ def act(ctx, action, items, params):
         return {"status": "refused", "message": str(exc)}
     except OSError:
         return {"status": "error", "message": "Could not access wallet storage. Check the host wallet."}
-    return {"status": "done", "detail": {"public_key": public}}
+    detail["public_key"] = public
+    return {"status": "done", "detail": detail}

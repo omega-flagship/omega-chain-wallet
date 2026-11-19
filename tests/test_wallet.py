@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import concurrent.futures
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -9,6 +11,7 @@ import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +20,7 @@ from coincurve import PrivateKey, PublicKey
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding
 
+import omega_chain_wallet
 from omega_chain_wallet import Wallet, WalletError
 from omega_chain_wallet.cli import _import_pem
 
@@ -182,10 +186,14 @@ class WalletTests(unittest.TestCase):
             mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
         envelope = base64.b64encode(encrypted).decode()
         result = act("import", name="Imported signer", envelope=envelope)
-        self.assertEqual(result, {"status": "done", "detail": {"public_key": public}})
-        self.assertEqual(act("import", envelope=envelope)["status"], "done")
+        self.assertEqual(result, {"status": "done", "detail": {"public_key": public, "import_outcome": "imported"}})
+        for name in ("Imported signer", ""):
+            self.assertEqual(act("import", name=name, envelope=envelope)["detail"]["import_outcome"], "present")
         self.assertEqual(dict(self.wallet.entries())[public], "Imported signer")
-        for bad in ("bad\nname", "x"*81, private.secret.hex()):
+        localized = "عائلة‏ 👨‍👩‍👧‍👦"
+        self.assertEqual(act("import", name=localized, envelope=envelope)["detail"]["import_outcome"], "renamed")
+        self.assertEqual(dict(self.wallet.entries())[public], localized)
+        for bad in ("bad\nname", "a\u2028b", "a\ud800b", "x"*81, private.secret.hex()):
             result = act("rename", [public], name=bad)
             self.assertEqual(result["status"], "refused")
             self.assertNotIn(bad, json.dumps(result))
@@ -215,3 +223,68 @@ class WalletTests(unittest.TestCase):
                 result = program.act(ctx, action, items, {"base_revision": graph["revision"], "local_operator": True})
                 self.assertEqual(result["status"], "refused")
         self.assertEqual(self.wallet.entries(), [(public, "")])
+
+    def test_damaged_names_are_isolated_and_repairable(self):
+        a = self.wallet.generate("Intact")
+        b = self.wallet.generate("Original")
+        sidecar = self.wallet.vault / (b + ".name")
+        for data, mode in [(b"x"*321, 0o600), (b"x"*81, 0o600), (b"\xff", 0o600),
+                           (b"two\nlines", 0o600), (b"public", 0o644), (None, None)]:
+            with self.subTest(data=data, mode=mode):
+                if data is None:
+                    sidecar.unlink()
+                    sidecar.symlink_to(self.master)
+                else:
+                    sidecar.write_bytes(data)
+                    sidecar.chmod(mode)
+                graph = program.view(None, None, None)
+                self.assertEqual({i["public_key"]: i["name"] for i in graph["items"][1:]}, {a: "Intact", b: ""})
+                ctx = SimpleNamespace(actor={"kind": "person", "local_operator": True, "route": "operator"})
+                result = program.act(ctx, "rename", [b], {"name": "Repaired", "base_revision": graph["revision"]})
+                self.assertEqual(result["status"], "done")
+                self.assertFalse(sidecar.is_symlink())
+                self.assertEqual(sidecar.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(dict(self.wallet.entries())[b], "Repaired")
+
+    def test_only_visible_names_are_opened_and_off_page_edits_invalidate_revision(self):
+        keys = sorted(self.wallet.generate(f"Signer {i}") for i in range(35))
+        with patch.object(omega_chain_wallet, "_read", wraps=omega_chain_wallet._read) as reads:
+            page = self.wallet.signer_page(focus=keys[-1])
+            self.assertEqual(page.number, 2)
+            self.assertEqual([call.args[1] for call in reads.call_args_list], [key + ".name" for key in keys[32:]])
+        with patch("os.scandir", wraps=os.scandir) as scans, patch.object(
+                omega_chain_wallet, "_read", wraps=omega_chain_wallet._read) as reads:
+            self.wallet.rename(keys[0], "Off-page rename", revision=page.revision)
+            self.assertEqual(scans.call_count, 1)
+            reads.assert_not_called()
+        with self.assertRaises(omega_chain_wallet.WalletChanged):
+            self.wallet.rename(keys[-1], "Stale", revision=page.revision)
+
+    def test_host_work_stays_off_loop_and_lock_wait_is_bounded(self):
+        ctx = SimpleNamespace(actor={"kind": "person", "local_operator": True, "route": "operator"},
+                              viewer={"kind": "operator", "local_operator": True, "route": "operator"})
+        main_thread = threading.get_ident()
+        keygen = program.rsa.generate_private_key
+        def checked_keygen(**kwargs):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            return keygen(**kwargs)
+
+        async def check():
+            with patch.object(program, "_recipient", None), patch.object(
+                    program.rsa, "generate_private_key", side_effect=checked_keygen) as rsa_keygen:
+                graph = await program.view(ctx, None, "unfold")
+                rsa_keygen.assert_called_once()
+            vault = os.open(self.wallet.vault, os.O_DIRECTORY)
+            try:
+                fcntl.flock(vault, fcntl.LOCK_EX)
+                read, write = await asyncio.wait_for(asyncio.gather(
+                    program.view(ctx, None, "unfold"),
+                    program.act(ctx, "generate", [], {"base_revision": graph["revision"]})), timeout=3)
+                self.assertEqual(read["revision"], "unavailable")
+                self.assertIn("busy", write["message"])
+            finally:
+                os.close(vault)
+            self.assertEqual(self.wallet.public_keys(), [])
+            self.assertEqual((await program.act(ctx, "generate", [], {"base_revision": graph["revision"]}))["status"], "done")
+
+        asyncio.run(check())

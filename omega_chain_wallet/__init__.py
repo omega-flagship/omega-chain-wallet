@@ -1,14 +1,17 @@
 """Operator-owned F1R3node signing keys. The Hive view reads public metadata."""
 from contextlib import contextmanager
+from dataclasses import dataclass
 import fcntl
 import hashlib
-import json
 import hmac
+import json
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
+import time
+import unicodedata
 
 from coincurve import PrivateKey, PublicKey
 from cryptography.exceptions import InvalidTag
@@ -27,9 +30,20 @@ def wallet_revision(entries):
     return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("ascii")).hexdigest()
 
 
+@dataclass(frozen=True)
+class SignerPage:
+    entries: list[tuple[str, str]]
+    count: int
+    number: int
+    pages: int
+    revision: str
+
+
 def _name(value):
-    if not isinstance(value, str) or len(value) > 80 or (value and not value.isprintable()):
-        raise WalletError("Use a name of up to 80 printable characters.")
+    if not isinstance(value, str) or len(value) > 80 or any(
+        unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"} for char in value
+    ):
+        raise WalletError("Use a single-line name of up to 80 characters without control characters.")
     if re.search(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", value):
         raise WalletError("Choose a display name without private key material.")
     return value.strip()
@@ -94,6 +108,38 @@ def _publish(directory, name, data, *, replace=False):
         except FileNotFoundError:
             pass
         os.fsync(directory)
+
+
+def _read_name(vault, public):
+    # A name is optional display metadata. Keep the same ownership and no-follow checks
+    # as other wallet files, but let the operator replace an unreadable name via Rename.
+    try:
+        return _name(_read(vault, public + ".name", 320, exact=False).decode("utf-8"))
+    except (OSError, UnicodeError, WalletError):
+        return ""
+
+
+def _exists(vault, filename):
+    try:
+        os.stat(filename, dir_fd=vault, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _lock(vault, mode, *, bounded):
+    if not bounded:
+        fcntl.flock(vault, mode)
+        return
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            fcntl.flock(vault, mode | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise WalletError("The wallet is busy. Try again.") from None
+            time.sleep(0.01)
 
 
 def _public_bytes(value):
@@ -164,18 +210,27 @@ class Wallet:
         return sorted(_public_bytes(match[1]).hex() for name in os.listdir(vault)
                       if (match := KEY_NAME.fullmatch(name)))
 
-    @classmethod
-    def _entries(cls, vault):
-        entries = []
-        for public in cls._keys(vault):
-            try:
-                name = _read(vault, public + ".name", 320, exact=False).decode("utf-8")
-            except FileNotFoundError:
-                name = ""
-            except UnicodeError:
-                raise WalletError("Invalid signer name in wallet storage.") from None
-            entries.append((public, _name(name)))
-        return entries
+    @staticmethod
+    def _catalog(vault):
+        # All wallet name writes replace the inode. ctime also detects in-place edits
+        # and permission changes on restore. Only the visible page opens label files.
+        keys = []
+        names = {}
+        with os.scandir(vault) as files:
+            for entry in files:
+                match = KEY_NAME.fullmatch(entry.name)
+                if match:
+                    keys.append(_public_bytes(match[1]).hex())
+                elif entry.name.endswith(".name"):
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        stamp = (info.st_ino, info.st_ctime_ns, info.st_mtime_ns, info.st_size)
+                    except OSError:
+                        stamp = "unreadable"
+                    names[entry.name[:-5]] = stamp
+        keys.sort()
+        stamps = [(key, names.get(key)) for key in keys]
+        return keys, names, wallet_revision(stamps)
 
     def public_keys(self):
         try:
@@ -184,20 +239,34 @@ class Wallet:
         except FileNotFoundError:
             return []
 
-    def entries(self):
+    def signer_page(self, number=1, *, size=32, focus=None):
         try:
             with _directory(self.vault) as vault:
-                fcntl.flock(vault, fcntl.LOCK_SH)
-                return self._entries(vault)
+                _lock(vault, fcntl.LOCK_SH, bounded=True)
+                keys, names, revision = self._catalog(vault)
+                count = len(keys)
+                size = max(1, count) if size is None else size
+                if size < 1:
+                    raise ValueError("Page size must be positive.")
+                pages = max(1, (count + size - 1) // size)
+                number = max(1, min(number, pages))
+                if focus and focus in keys:
+                    number = keys.index(focus) // size + 1
+                entries = [(key, _read_name(vault, key) if key in names else "")
+                           for key in keys[(number - 1) * size:number * size]]
+                return SignerPage(entries, count, number, pages, revision)
         except FileNotFoundError:
-            return []
+            return SignerPage([], 0, 1, 1, wallet_revision([]))
+
+    def entries(self):
+        return self.signer_page(size=None).entries
 
     @contextmanager
     def _edit(self, revision):
         try:
             with _directory(self.vault) as vault:
-                fcntl.flock(vault, fcntl.LOCK_EX)
-                if revision is not None and wallet_revision(self._entries(vault)) != revision:
+                _lock(vault, fcntl.LOCK_EX, bounded=revision is not None)
+                if revision is not None and self._catalog(vault)[2] != revision:
                     raise WalletChanged("The wallet changed. Refresh and try again.")
                 yield vault
         except FileNotFoundError:
@@ -207,7 +276,7 @@ class Wallet:
         public = _public_bytes(public).hex()
         name = _name(name)
         with self._edit(revision) as vault:
-            if public not in self._keys(vault):
+            if not _exists(vault, public + ".owk"):
                 raise WalletError("The selected signer is absent from the wallet.")
             _publish(vault, public + ".name", name.encode("utf-8"), replace=True)
         return public
@@ -233,26 +302,33 @@ class Wallet:
         name = _name(name)
         with self._edit(revision) as vault:
             master = self._master(vault)
-            names = set(os.listdir(vault))
-            if filename in names:
+            outcome = "imported"
+            if _exists(vault, filename):
                 self._unlock(vault, master, public)
-                if name:
+                outcome = "present"
+                if name and name != _read_name(vault, public.hex()):
                     _publish(vault, public.hex() + ".name", name.encode("utf-8"), replace=True)
+                    outcome = "renamed"
             else:
                 nonce = secrets.token_bytes(12)
                 record = nonce + AESGCM(master).encrypt(nonce, key.secret, DOMAIN + public)
                 # Publish the name first. Readers only discover keys with a complete record.
                 sidecar = public.hex() + ".name"
-                if name or sidecar in names:
+                if name or _exists(vault, sidecar):
                     _publish(vault, sidecar, name.encode("utf-8"), replace=True)
                 if not _publish(vault, filename, record):
                     self._unlock(vault, master, public)
-        return public.hex()
+                    outcome = "renamed" if name else "present"
+        return public.hex(), outcome
 
     def generate(self, name="", *, revision=None):
-        return self._store(PrivateKey(), name, revision)
+        return self._store(PrivateKey(), name, revision)[0]
 
     def import_secret(self, secret, name="", *, revision=None):
+        return self.import_signer(secret, name, revision=revision)[0]
+
+    def import_signer(self, secret, name="", *, revision=None):
+        """Return the public key and whether the import added, found, or renamed it."""
         if not isinstance(secret, bytes) or len(secret) != 32:
             raise WalletError("Expected a 32-byte secp256k1 private key.")
         try:

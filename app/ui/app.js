@@ -9,6 +9,8 @@ let mode;
 let target;
 let opener;
 let busy = false;
+// Each host context owns its requests, editor and encryption recipient.
+let contextVersion = 0;
 
 function request(op, body) {
   return new Promise((resolve, reject) => {
@@ -34,6 +36,8 @@ function setBusy(value) {
 function closeEditor() {
   el('secret').value = '';
   el('name').value = '';
+  el('selected').textContent = '';
+  target = null;
   el('feedback').textContent = '';
   el('editor').hidden = true;
   mode = null;
@@ -62,7 +66,7 @@ function edit(action, source, item) {
 function render(graph) {
   const items = graph?.items || [];
   const wallet = items.find(item => item.kind === 'wallet');
-  if (!Number.isInteger(wallet?.count)) throw new Error('The host could not read the wallet.');
+  if (!Number.isInteger(wallet?.count)) throw new Error(wallet?.summary || 'The host could not read the wallet.');
   page = wallet.page;
   revision = graph.revision;
   recipient = wallet.import_recipient;
@@ -96,19 +100,26 @@ function render(graph) {
   el('page').textContent = 'Page ' + page + ' of ' + wallet.pages;
 }
 
+function clearView() {
+  el('keys').replaceChildren();
+  el('actions').hidden = el('pages').hidden = true;
+  el('count').textContent = '';
+  revision = recipient = null;
+}
+
 async function load(focus) {
+  const version = contextVersion;
   closeEditor();
   setBusy(true);
   try {
-    render(await request('view', {focus, stage: 'unfold'}));
+    const graph = await request('view', {focus, stage: 'unfold'});
+    if (version === contextVersion) render(graph);
   } catch (error) {
+    if (version !== contextVersion) return;
+    clearView();
     el('status').textContent = error.message;
-    el('keys').replaceChildren();
-    el('actions').hidden = el('pages').hidden = true;
-    el('count').textContent = '';
-    revision = recipient = null;
   } finally {
-    setBusy(false);
+    if (version === contextVersion) setBusy(false);
   }
 }
 
@@ -126,9 +137,14 @@ async function seal(value) {
 
 async function save() {
   if (busy || !mode || !revision) return;
+  const version = contextVersion;
   const action = mode;
   const params = {name: el('name').value.trim()};
   el('feedback').textContent = '';
+  if (Array.from(params.name).length > 80) {
+    el('feedback').textContent = 'Use a name of up to 80 characters.';
+    return;
+  }
   setBusy(true);
   try {
     if (action === 'import') {
@@ -144,7 +160,9 @@ async function save() {
         throw new Error('Could not encrypt this key. Open Hive over HTTPS or localhost and refresh.');
       }
     }
+    if (version !== contextVersion) return;
     const result = await request('act', {action, items: target ? [target] : [], params, base_revision: revision});
+    if (version !== contextVersion) return;
     if (result?.status !== 'done') {
       if (result?.status === 'stale') {
         el('notice').textContent = 'The wallet changed. Review the current list and try again.';
@@ -153,19 +171,40 @@ async function save() {
       }
       throw new Error(result?.message || 'The host could not complete the action.');
     }
-    el('notice').textContent = {generate: 'Key generated.', import: 'Key imported.', rename: 'Signer name saved.'}[action];
+    const importNotice = {
+      imported: 'Key imported.',
+      present: 'This key is already in the wallet.',
+      renamed: 'This key was already in the wallet. Its name was updated.',
+    };
+    el('notice').textContent = {
+      generate: 'Key generated.',
+      import: importNotice[result.detail.import_outcome] || 'Key imported.',
+      rename: 'Signer name saved.',
+    }[action];
     await load(result.detail.public_key);
   } catch (error) {
-    el('feedback').textContent = error.message;
+    if (version === contextVersion) el('feedback').textContent = error.message;
   } finally {
-    setBusy(false);
+    if (version === contextVersion) setBusy(false);
   }
 }
 
 window.addEventListener('message', event => {
   const msg = event.data;
   if (!channel || event.source !== parent || event.origin !== origin || msg?.channel !== channel) return;
-  if (msg.type === 'app-context' && !busy) { load('page-' + page); return; }
+  if (msg.type === 'app-context') {
+    contextVersion++;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('The Hive context changed.'));
+      pending = null;
+    }
+    clearView();
+    el('notice').textContent = '';
+    el('status').textContent = 'Loading wallet…';
+    load('page-1');
+    return;
+  }
   if (msg.type !== 'app-reply' || !pending || msg.id !== pending.id) return;
   const call = pending;
   pending = null;
@@ -181,7 +220,7 @@ for (const action of ['generate', 'import']) el(action).onclick = () => edit(act
 el('save').onclick = save;
 el('cancel').onclick = closeEditor;
 el('editor').onkeydown = event => {
-  if (busy) return;
+  if (busy || event.isComposing || event.keyCode === 229) return;
   if (event.key === 'Escape') closeEditor();
   if (event.key === 'Enter' && event.target.matches('input')) save();
 };

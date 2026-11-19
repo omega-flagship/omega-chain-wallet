@@ -8,7 +8,7 @@ Open **Apps → Chain Wallet** after initializing the host wallet.
 
 - **Generate key** creates a new secp256k1 signer on the host. You can enter a name before saving. A new signer starts unfunded.
 - **Import key** accepts a 64-digit hex private key in a masked field. The browser encrypts it for the wallet process using Web Crypto RSA-OAEP with SHA-256. Use HTTPS or localhost. A Hive restart rotates the import recipient. Refresh the app if an import was interrupted. For encrypted F1R3node PKCS#8 files, use the host CLI below.
-- **Rename** adds, changes or clears the name of any signer, including keys previously added through the CLI. Importing an existing key preserves its name unless you supply another one.
+- **Rename** adds, changes or clears the name of any signer, including keys previously added through the CLI. Importing an existing key preserves its name unless you supply another one. The app reports when a duplicate import changes the name.
 
 Names are visible to everyone who can view the app. The host stores them in owner-only `.name` files alongside the encrypted records. A name identifies a signer in the interface. Chain integrations continue to select it by its public key.
 
