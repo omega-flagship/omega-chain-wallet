@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omega-chain-wallet"
+version = "0.1.0"
+description = "Host-side F1R3node signing key storage for OmegaHive"
+requires-python = ">=3.12"
+dependencies = ["coincurve>=20,<22", "cryptography>=42"]
+
+[project.scripts]
+omega-chain-wallet = "omega_chain_wallet.cli:main"
+
+[tool.setuptools]
+packages = ["omega_chain_wallet"]

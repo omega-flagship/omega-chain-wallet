@@ -1,2 +1,13 @@
 *~
 .env
+
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+*.owk
+*.key
+*.sk
+*.hex
+wallet.id

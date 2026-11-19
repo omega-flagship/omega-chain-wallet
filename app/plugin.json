@@ -1,0 +1,10 @@
+{
+  "id": "omega-chain-wallet",
+  "name": "Chain Wallet",
+  "version": "0.1.0",
+  "contract": "0.1",
+  "module": "program.py",
+  "description": "Public signing keys for the host’s F1R3node wallet.",
+  "icon": "key",
+  "capabilities": []
+}
