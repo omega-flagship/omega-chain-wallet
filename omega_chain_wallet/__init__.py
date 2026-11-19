@@ -1,6 +1,8 @@
-"""Operator-owned F1R3node signing keys. The Hive view uses only public_keys()."""
+"""Operator-owned F1R3node signing keys. The Hive view reads public metadata."""
 from contextlib import contextmanager
 import fcntl
+import hashlib
+import json
 import hmac
 import os
 from pathlib import Path
@@ -15,6 +17,22 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 class WalletError(ValueError):
     """A message safe to pass to the caller."""
+
+
+class WalletChanged(WalletError):
+    """The caller viewed an older wallet snapshot."""
+
+
+def wallet_revision(entries):
+    return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def _name(value):
+    if not isinstance(value, str) or len(value) > 80 or (value and not value.isprintable()):
+        raise WalletError("Use a name of up to 80 printable characters.")
+    if re.search(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", value):
+        raise WalletError("Choose a display name without private key material.")
+    return value.strip()
 
 
 DOMAIN = b"omega-chain-wallet/v1/"
@@ -39,7 +57,7 @@ def _directory(path, *, create=False):
         os.close(fd)
 
 
-def _read(directory, name, size):
+def _read(directory, name, size, *, exact=True):
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     try:
         _check_access(os.fstat(fd), stat.S_ISREG)
@@ -47,13 +65,13 @@ def _read(directory, name, size):
             data = handle.read(size + 1)
     finally:
         os.close(fd)
-    if len(data) != size:
+    if len(data) > size or (exact and len(data) != size):
         raise WalletError("Wallet file has an invalid size.")
     return data
 
 
-def _publish(directory, name, data):
-    """Publish a complete immutable file. A concurrent initializer may win."""
+def _publish(directory, name, data, *, replace=False):
+    """Publish a complete file atomically. Only mutable metadata may be replaced."""
     tmp = "." + secrets.token_hex(16) + ".tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
     try:
@@ -62,13 +80,19 @@ def _publish(directory, name, data):
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        if replace:
+            os.replace(tmp, name, src_dir_fd=directory, dst_dir_fd=directory)
+            return True
         try:
             os.link(tmp, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
         except FileExistsError:
             return False
         return True
     finally:
-        os.unlink(tmp, dir_fd=directory)
+        try:
+            os.unlink(tmp, dir_fd=directory)
+        except FileNotFoundError:
+            pass
         os.fsync(directory)
 
 
@@ -135,14 +159,58 @@ class Wallet:
             raise WalletError("Wallet configuration is missing. Initialize a new wallet or restore its backup.") from None
         return master
 
+    @staticmethod
+    def _keys(vault):
+        return sorted(_public_bytes(match[1]).hex() for name in os.listdir(vault)
+                      if (match := KEY_NAME.fullmatch(name)))
+
+    @classmethod
+    def _entries(cls, vault):
+        entries = []
+        for public in cls._keys(vault):
+            try:
+                name = _read(vault, public + ".name", 320, exact=False).decode("utf-8")
+            except FileNotFoundError:
+                name = ""
+            except UnicodeError:
+                raise WalletError("Invalid signer name in wallet storage.") from None
+            entries.append((public, _name(name)))
+        return entries
+
     def public_keys(self):
-        # The Hive app only enumerates record names. Neither secret file is opened.
         try:
             with _directory(self.vault) as vault:
-                names = os.listdir(vault)
+                return self._keys(vault)
         except FileNotFoundError:
             return []
-        return sorted(_public_bytes(match[1]).hex() for name in names if (match := KEY_NAME.fullmatch(name)))
+
+    def entries(self):
+        try:
+            with _directory(self.vault) as vault:
+                fcntl.flock(vault, fcntl.LOCK_SH)
+                return self._entries(vault)
+        except FileNotFoundError:
+            return []
+
+    @contextmanager
+    def _edit(self, revision):
+        try:
+            with _directory(self.vault) as vault:
+                fcntl.flock(vault, fcntl.LOCK_EX)
+                if revision is not None and wallet_revision(self._entries(vault)) != revision:
+                    raise WalletChanged("The wallet changed. Refresh and try again.")
+                yield vault
+        except FileNotFoundError:
+            raise WalletError("Initialize the wallet before editing signers.") from None
+
+    def rename(self, public, name, *, revision=None):
+        public = _public_bytes(public).hex()
+        name = _name(name)
+        with self._edit(revision) as vault:
+            if public not in self._keys(vault):
+                raise WalletError("The selected signer is absent from the wallet.")
+            _publish(vault, public + ".name", name.encode("utf-8"), replace=True)
+        return public
 
     @staticmethod
     def _unlock(vault, master, public):
@@ -159,31 +227,39 @@ class Wallet:
             raise WalletError("Signing key record does not match its public key.")
         return key
 
-    def _store(self, key):
+    def _store(self, key, name, revision):
         public = key.public_key.format(compressed=False)
-        try:
-            with _directory(self.vault) as vault:
-                master = self._master(vault)
+        filename = public.hex() + ".owk"
+        name = _name(name)
+        with self._edit(revision) as vault:
+            master = self._master(vault)
+            names = set(os.listdir(vault))
+            if filename in names:
+                self._unlock(vault, master, public)
+                if name:
+                    _publish(vault, public.hex() + ".name", name.encode("utf-8"), replace=True)
+            else:
                 nonce = secrets.token_bytes(12)
                 record = nonce + AESGCM(master).encrypt(nonce, key.secret, DOMAIN + public)
-                if not _publish(vault, public.hex() + ".owk", record):
-                    # A duplicate import is successful only if the existing key is usable.
+                # Publish the name first. Readers only discover keys with a complete record.
+                sidecar = public.hex() + ".name"
+                if name or sidecar in names:
+                    _publish(vault, sidecar, name.encode("utf-8"), replace=True)
+                if not _publish(vault, filename, record):
                     self._unlock(vault, master, public)
-        except FileNotFoundError:
-            raise WalletError("Initialize the wallet before storing keys.") from None
         return public.hex()
 
-    def generate(self):
-        return self._store(PrivateKey())
+    def generate(self, name="", *, revision=None):
+        return self._store(PrivateKey(), name, revision)
 
-    def import_secret(self, secret):
+    def import_secret(self, secret, name="", *, revision=None):
         if not isinstance(secret, bytes) or len(secret) != 32:
             raise WalletError("Expected a 32-byte secp256k1 private key.")
         try:
             key = PrivateKey(secret)
         except ValueError:
             raise WalletError("Invalid secp256k1 private key.") from None
-        return self._store(key)
+        return self._store(key, name, revision)
 
     def sign_digest(self, public_key, digest):
         """Host-only DER signature over an already hashed F1R3node deploy."""

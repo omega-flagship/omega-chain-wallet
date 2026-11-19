@@ -9,12 +9,34 @@
 <body>
   <main>
     <header>
-      <div><p class="network">F1R3node · secp256k1</p><h1>Public keys</h1></div>
+      <div><p class="network">F1R3node · secp256k1</p><h1>Chain Wallet</h1></div>
       <button id="refresh" type="button">Refresh</button>
     </header>
+    <div id="actions" class="actions" hidden>
+      <button id="generate" type="button" class="primary">Generate key</button>
+      <button id="import" type="button">Import key</button>
+    </div>
+    <section id="editor" aria-labelledby="editor-title" hidden>
+      <h2 id="editor-title"></h2>
+      <code id="selected" hidden></code>
+      <label for="name">Signer name <small>(optional)</small></label>
+      <input id="name" type="text" maxlength="80" autocomplete="off" dir="auto">
+      <div id="import-fields" hidden>
+        <label for="secret">Private key</label>
+        <input id="secret" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" aria-describedby="hex-hint">
+        <small id="hex-hint">Enter the 64 hexadecimal digits of your signing key.</small>
+      </div>
+      <p id="feedback" role="alert"></p>
+      <div class="actions">
+        <button id="save" type="button" class="primary"></button>
+        <button id="cancel" type="button">Cancel</button>
+      </div>
+    </section>
+    <p id="notice" role="status"></p>
+    <div class="list-heading"><h2>Signers</h2><span id="count"></span></div>
     <p id="status" role="status">Loading wallet…</p>
-    <ul id="keys" aria-label="Wallet public keys"></ul>
-    <nav id="pages" aria-label="Public key pages" hidden>
+    <ul id="keys" aria-label="Signing keys"></ul>
+    <nav id="pages" aria-label="Signer pages" hidden>
       <button id="prev" type="button">Previous</button>
       <span id="page"></span>
       <button id="next" type="button">Next</button>

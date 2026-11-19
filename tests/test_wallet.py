@@ -1,3 +1,4 @@
+import base64
 import concurrent.futures
 import hashlib
 import importlib.util
@@ -9,11 +10,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from coincurve import PrivateKey, PublicKey
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding
 
 from omega_chain_wallet import Wallet, WalletError
 from omega_chain_wallet.cli import _import_pem
@@ -57,9 +59,9 @@ class WalletTests(unittest.TestCase):
         graph = program.view(None, None, "unfold")
         self.assertEqual(graph["items"][1]["public_key"], public)
         self.assertNotIn(private.secret.hex(), json.dumps(graph))
-        self.assertEqual(program.describe()["actions"], [])
-        with self.assertRaises(ValueError):
-            program.act(None, "sign", [], {})
+        self.assertNotIn("import_recipient", graph["items"][0])
+        self.assertNotIn("sign", {act["id"] for act in program.describe()["actions"]})
+        self.assertEqual(program.act(None, "sign", [], {})["status"], "refused")
         with self.assertRaises(WalletError):
             self.wallet.initialize()
         self.assertFalse(self.master.exists())
@@ -155,3 +157,61 @@ class WalletTests(unittest.TestCase):
         last = program.view(None, "page-2", None)
         self.assertEqual(first["items"][0]["pages"], 2)
         self.assertEqual([row["public_key"] for graph in (first, last) for row in graph["items"][1:]], keys)
+
+    def test_ui_operator_roundtrip_and_stale_retry(self):
+        ctx = SimpleNamespace(actor={"kind": "person", "local_operator": True, "route": "operator"},
+                              viewer={"kind": "operator", "local_operator": True, "route": "operator"})
+        def snapshot():
+            return program.view(ctx, None, "unfold")
+        def act(action, items=(), **params):
+            params.setdefault("base_revision", snapshot()["revision"])
+            return program.act(ctx, action, list(items), params)
+
+        first = snapshot()
+        def generate(_):
+            return act("generate", name="First signer", base_revision=first["revision"])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(generate, range(2)))
+        self.assertCountEqual([r["status"] for r in results], ["done", "stale"])
+        self.assertEqual(snapshot()["items"][1]["name"], "First signer")
+
+        private = PrivateKey()
+        public = private.public_key.format(False).hex()
+        recipient = serialization.load_der_public_key(base64.b64decode(first["items"][0]["import_recipient"]))
+        encrypted = recipient.encrypt(private.secret, padding.OAEP(
+            mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        envelope = base64.b64encode(encrypted).decode()
+        result = act("import", name="Imported signer", envelope=envelope)
+        self.assertEqual(result, {"status": "done", "detail": {"public_key": public}})
+        self.assertEqual(act("import", envelope=envelope)["status"], "done")
+        self.assertEqual(dict(self.wallet.entries())[public], "Imported signer")
+        for bad in ("bad\nname", "x"*81, private.secret.hex()):
+            result = act("rename", [public], name=bad)
+            self.assertEqual(result["status"], "refused")
+            self.assertNotIn(bad, json.dumps(result))
+        before = snapshot()["revision"]
+        self.assertEqual(act("rename", [public], name="Deploy QA")["status"], "done")
+        self.assertNotEqual(snapshot()["revision"], before)
+        self.assertEqual(act("rename", [public], name="Lost edit", base_revision=before)["status"], "stale")
+        self.assertEqual(dict(Wallet.from_env().entries())[public], "Deploy QA")
+        digest = secrets.token_bytes(32)
+        self.assertTrue(private.public_key.verify(self.wallet.sign_digest(public, digest), digest, hasher=None))
+        self.assertEqual(act("rename", [public], name="")["status"], "done")
+        self.assertEqual(dict(self.wallet.entries())[public], "")
+        for invalid in ("!"*344, private.secret.hex(), "A"*344):
+            result = act("import", envelope=invalid)
+            self.assertEqual(result["status"], "refused")
+            self.assertNotIn(invalid, json.dumps(result))
+        self.assertEqual(len(self.wallet.public_keys()), 2)
+
+    def test_host_identity_required_for_wallet_edits(self):
+        public = self.wallet.generate()
+        for actor in (None, {"kind": "person", "role": "admin", "local_operator": False, "route": "operator"},
+                      {"kind": "mind", "local_operator": True, "route": "agent"}):
+            ctx = SimpleNamespace(actor=actor, viewer=actor)
+            graph = program.view(ctx, None, None)
+            self.assertNotIn("import_recipient", graph["items"][0])
+            for action, items in [("generate", []), ("import", []), ("rename", [public])]:
+                result = program.act(ctx, action, items, {"base_revision": graph["revision"], "local_operator": True})
+                self.assertEqual(result["status"], "refused")
+        self.assertEqual(self.wallet.entries(), [(public, "")])
